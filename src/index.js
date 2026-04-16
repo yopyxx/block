@@ -57,7 +57,7 @@ function buildCommands() {
       .addStringOption((option) =>
         option
           .setName("채널id")
-          .setDescription("차단할 채널 ID 또는 <#채널ID>")
+          .setDescription("차단할 채널 ID들. 쉼표나 공백으로 여러 개 입력 가능")
           .setRequired(true),
       ),
     new SlashCommandBuilder()
@@ -68,7 +68,7 @@ function buildCommands() {
       .addStringOption((option) =>
         option
           .setName("채널id")
-          .setDescription("해제할 채널 ID 또는 <#채널ID>")
+          .setDescription("해제할 채널 ID들. 쉼표나 공백으로 여러 개 입력 가능")
           .setRequired(true),
       ),
     new SlashCommandBuilder()
@@ -151,6 +151,31 @@ function parseChannelId(input) {
   return null;
 }
 
+function parseChannelIds(input) {
+  const tokens = input
+    .split(/[,\s]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const channelIds = [];
+  const invalidTokens = [];
+
+  for (const token of tokens) {
+    const channelId = parseChannelId(token);
+
+    if (channelId) {
+      channelIds.push(channelId);
+    } else {
+      invalidTokens.push(token);
+    }
+  }
+
+  if (invalidTokens.length > 0) {
+    throw new UserFacingError(`읽을 수 없는 채널 ID가 있습니다: ${invalidTokens.slice(0, 5).join(", ")}`);
+  }
+
+  return uniqueSnowflakes(channelIds);
+}
+
 function ensureGuildConfig(config, guildId) {
   if (!config.guilds[guildId]) {
     config.guilds[guildId] = { blockedChannelIds: [] };
@@ -223,6 +248,20 @@ async function fetchTargetChannel(guild, channelId) {
   return channel;
 }
 
+async function fetchTargetChannels(guild, channelIds) {
+  if (channelIds.length === 0) {
+    throw new UserFacingError("채널 ID 또는 `<#채널ID>` 형태로 하나 이상 입력해주세요.");
+  }
+
+  const channels = [];
+
+  for (const channelId of channelIds) {
+    channels.push(await fetchTargetChannel(guild, channelId));
+  }
+
+  return channels;
+}
+
 async function findManagedAutoModRule(guild) {
   const rules = await guild.autoModerationRules.fetch();
   return rules.find((rule) => rule.name === MANAGED_RULE_NAME) ?? null;
@@ -261,7 +300,9 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
     throw new UserFacingError(
       [
         `현재 구성은 제외 채널이 ${exemptChannelIds.length}개라 AutoMod 제한(${MAX_EXEMPT_CHANNELS}개)을 넘습니다.`,
-        "발송 전 차단을 특정 채널에만 적용하려면 차단 대상 채널을 늘리거나 서버 채널 구조를 줄여야 합니다.",
+        `현재 차단 대상 채널은 ${blockedChannelIds.length}개입니다.`,
+        `발송 전 차단을 적용하려면 차단 대상 채널을 최소 ${blockedChannelIds.length + exemptChannelIds.length - MAX_EXEMPT_CHANNELS}개로 늘려야 합니다.`,
+        `/멘션차단 채널id:채널1,채널2,... 형태로 ${exemptChannelIds.length - MAX_EXEMPT_CHANNELS}개 이상 더 추가해주세요.`,
       ].join("\n"),
     );
   }
@@ -333,24 +374,30 @@ function formatChannelList(channelIds) {
   ].join("\n");
 }
 
+function formatChannelMentions(channelIds) {
+  const shownChannelIds = channelIds.slice(0, 12);
+  const remainingCount = channelIds.length - shownChannelIds.length;
+  const suffix = remainingCount > 0 ? ` 외 ${remainingCount}개` : "";
+
+  return `${shownChannelIds.map((channelId) => `<#${channelId}>`).join(", ")}${suffix}`;
+}
+
 async function handleBlock(interaction) {
-  const channelId = parseChannelId(interaction.options.getString("채널id", true));
+  const channelIds = parseChannelIds(interaction.options.getString("채널id", true));
 
-  if (!channelId) {
-    throw new UserFacingError("채널 ID 또는 `<#채널ID>` 형태로 입력해주세요.");
-  }
-
-  const channel = await fetchTargetChannel(interaction.guild, channelId);
+  const channels = await fetchTargetChannels(interaction.guild, channelIds);
   const config = await readConfig();
   const guildConfig = ensureGuildConfig(config, interaction.guildId);
-  const requestedBlockedIds = uniqueSnowflakes([...guildConfig.blockedChannelIds, channel.id]);
+  const targetChannelIds = channels.map((channel) => channel.id);
+  const requestedBlockedIds = uniqueSnowflakes([...guildConfig.blockedChannelIds, ...targetChannelIds]);
   const result = await syncAutoModRule(interaction.guild, requestedBlockedIds);
 
   await saveGuildBlockedChannels(config, interaction.guildId, result.blockedChannelIds);
   await interaction.editReply({
     content: [
-      `<#${channel.id}> 채널에서 역할 멘션을 발송 전에 차단합니다.`,
+      `${formatChannelMentions(targetChannelIds)} 채널에서 역할 멘션을 발송 전에 차단합니다.`,
       `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
+      `현재 차단 대상 채널 수: ${result.blockedChannelIds.length}`,
       `제외 채널 수: ${result.exemptChannelCount}/${MAX_EXEMPT_CHANNELS}`,
     ].join("\n"),
     allowedMentions: { parse: [] },
@@ -358,21 +405,22 @@ async function handleBlock(interaction) {
 }
 
 async function handleUnblock(interaction) {
-  const channelId = parseChannelId(interaction.options.getString("채널id", true));
+  const channelIds = parseChannelIds(interaction.options.getString("채널id", true));
 
-  if (!channelId) {
-    throw new UserFacingError("채널 ID 또는 `<#채널ID>` 형태로 입력해주세요.");
-  }
+  await fetchTargetChannels(interaction.guild, channelIds);
 
   const config = await readConfig();
   const guildConfig = ensureGuildConfig(config, interaction.guildId);
-  const requestedBlockedIds = guildConfig.blockedChannelIds.filter((id) => id !== channelId);
+  const unblockChannelIdSet = new Set(channelIds);
+  const requestedBlockedIds = guildConfig.blockedChannelIds.filter(
+    (id) => !unblockChannelIdSet.has(id),
+  );
   const result = await syncAutoModRule(interaction.guild, requestedBlockedIds);
 
   await saveGuildBlockedChannels(config, interaction.guildId, result.blockedChannelIds);
   await interaction.editReply({
     content: [
-      `<#${channelId}> 채널의 역할 멘션 발송 전 차단을 해제했습니다.`,
+      `${formatChannelMentions(channelIds)} 채널의 역할 멘션 발송 전 차단을 해제했습니다.`,
       `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
       `남은 차단 채널 수: ${result.blockedChannelIds.length}`,
     ].join("\n"),
