@@ -130,6 +130,12 @@ function uniqueSnowflakes(values) {
   return [...new Set(values.map(String).filter((value) => SNOWFLAKE_RE.test(value)))];
 }
 
+function getConfiguredGuildIds() {
+  const rawValue = [process.env.GUILD_IDS, process.env.GUILD_ID].filter(Boolean).join(",");
+
+  return uniqueSnowflakes(rawValue.split(",").map((value) => value.trim()).filter(Boolean));
+}
+
 function parseChannelId(input) {
   const value = input.trim();
   const mentionMatch = value.match(CHANNEL_MENTION_RE);
@@ -357,3 +363,216 @@ async function handleUnblock(interaction) {
   if (!channelId) {
     throw new UserFacingError("채널 ID 또는 `<#채널ID>` 형태로 입력해주세요.");
   }
+
+  const config = await readConfig();
+  const guildConfig = ensureGuildConfig(config, interaction.guildId);
+  const requestedBlockedIds = guildConfig.blockedChannelIds.filter((id) => id !== channelId);
+  const result = await syncAutoModRule(interaction.guild, requestedBlockedIds);
+
+  await saveGuildBlockedChannels(config, interaction.guildId, result.blockedChannelIds);
+  await interaction.editReply({
+    content: [
+      `<#${channelId}> 채널의 역할 멘션 발송 전 차단을 해제했습니다.`,
+      `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
+      `남은 차단 채널 수: ${result.blockedChannelIds.length}`,
+    ].join("\n"),
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleList(interaction) {
+  const config = await readConfig();
+  const blockedChannelIds = config.guilds[interaction.guildId]?.blockedChannelIds ?? [];
+
+  await interaction.editReply({
+    content: formatChannelList(blockedChannelIds),
+    allowedMentions: { parse: [] },
+  });
+}
+
+function translateRuleAction(action) {
+  switch (action) {
+    case "created":
+      return "생성됨";
+    case "updated":
+      return "갱신됨";
+    case "deleted":
+      return "삭제됨";
+    default:
+      return "변경 없음";
+  }
+}
+
+async function handleInteraction(interaction) {
+  if (!interaction.isChatInputCommand() || !Object.values(COMMANDS).includes(interaction.commandName)) {
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.guild || !interaction.guildId) {
+      throw new UserFacingError("서버 안에서만 사용할 수 있는 명령어입니다.");
+    }
+
+    assertUserCanUseCommand(interaction);
+
+    if (interaction.commandName === COMMANDS.block) {
+      await handleBlock(interaction);
+      return;
+    }
+
+    if (interaction.commandName === COMMANDS.unblock) {
+      await handleUnblock(interaction);
+      return;
+    }
+
+    if (interaction.commandName === COMMANDS.list) {
+      await handleList(interaction);
+    }
+  } catch (error) {
+    const message =
+      error instanceof UserFacingError
+        ? error.message
+        : "처리 중 오류가 발생했습니다. 콘솔 로그를 확인해주세요.";
+
+    if (!(error instanceof UserFacingError)) {
+      console.error(error);
+    }
+
+    await interaction.editReply({
+      content: message,
+      allowedMentions: { parse: [] },
+    });
+  }
+}
+
+async function registerCommands(client) {
+  const commands = buildCommands();
+  const guildIds = getConfiguredGuildIds();
+
+  if (guildIds.length > 0) {
+    let registeredGuildCount = 0;
+
+    for (const guildId of guildIds) {
+      try {
+        const guild = await client.guilds.fetch(guildId);
+        await guild.commands.set(commands);
+        registeredGuildCount += 1;
+        console.log(`Registered ${commands.length} guild commands in ${guild.name}.`);
+      } catch (error) {
+        console.error(`Failed to register guild commands in ${guildId}:`, error);
+      }
+    }
+
+    if (registeredGuildCount === 0) {
+      throw new Error("Failed to register commands in every configured guild.");
+    }
+
+    console.log(`Registered commands in ${registeredGuildCount}/${guildIds.length} configured guilds.`);
+    return;
+  }
+
+  await client.application.commands.set(commands);
+  console.log(`Registered ${commands.length} global commands.`);
+}
+
+async function syncGuildFromConfig(client, guildId) {
+  const config = await readConfig();
+  const blockedChannelIds = config.guilds[guildId]?.blockedChannelIds ?? [];
+
+  if (blockedChannelIds.length === 0) {
+    return;
+  }
+
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+
+  if (!guild) {
+    return;
+  }
+
+  const result = await syncAutoModRule(guild, blockedChannelIds);
+
+  if (result.blockedChannelIds.length !== blockedChannelIds.length) {
+    await saveGuildBlockedChannels(config, guildId, result.blockedChannelIds);
+  }
+}
+
+async function syncAllConfiguredGuilds(client) {
+  const config = await readConfig();
+
+  for (const guildId of Object.keys(config.guilds)) {
+    try {
+      await syncGuildFromConfig(client, guildId);
+      console.log(`Synced AutoMod rule for guild ${guildId}.`);
+    } catch (error) {
+      console.error(`Failed to sync AutoMod rule for guild ${guildId}:`, error);
+    }
+  }
+}
+
+const pendingGuildSyncs = new Map();
+
+function queueGuildSync(client, guildId) {
+  const pendingSync = pendingGuildSyncs.get(guildId);
+
+  if (pendingSync) {
+    clearTimeout(pendingSync);
+  }
+
+  pendingGuildSyncs.set(
+    guildId,
+    setTimeout(async () => {
+      pendingGuildSyncs.delete(guildId);
+
+      try {
+        await syncGuildFromConfig(client, guildId);
+        console.log(`Resynced AutoMod rule for guild ${guildId}.`);
+      } catch (error) {
+        console.error(`Failed to resync AutoMod rule for guild ${guildId}:`, error);
+      }
+    }, 1500),
+  );
+}
+
+function createClient() {
+  return new Client({
+    intents: [GatewayIntentBits.Guilds],
+  });
+}
+
+async function main() {
+  const token = process.env.DISCORD_TOKEN?.trim();
+
+  if (!token) {
+    throw new Error("DISCORD_TOKEN is required. Copy .env.example to .env and fill it in.");
+  }
+
+  const client = createClient();
+
+  client.once(Events.ClientReady, async (readyClient) => {
+    console.log(`Logged in as ${readyClient.user.tag}.`);
+    await registerCommands(readyClient);
+    await syncAllConfiguredGuilds(readyClient);
+  });
+
+  client.on(Events.InteractionCreate, handleInteraction);
+  client.on(Events.ChannelCreate, (channel) => {
+    if (channel.guildId && isEligibleAutoModChannel(channel)) {
+      queueGuildSync(client, channel.guildId);
+    }
+  });
+  client.on(Events.ChannelDelete, (channel) => {
+    if (channel.guildId) {
+      queueGuildSync(client, channel.guildId);
+    }
+  });
+
+  await client.login(token);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
