@@ -1,0 +1,16 @@
+{
+  "name": "role-mention-blocker",
+  "version": "1.0.0",
+  "description": "Discord bot that blocks role mentions in selected channels before messages are sent.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14",
+    "dotenv": "^16"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "license": "MIT"
