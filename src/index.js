@@ -30,6 +30,7 @@ const MAX_EXEMPT_CHANNELS = 50;
 const MAX_EXEMPT_ROLES = 20;
 const SNOWFLAKE_RE = /^\d{17,20}$/;
 const CHANNEL_MENTION_RE = /^<#(\d{17,20})>$/;
+const PERMISSION_FALLBACK_STATES = new Set(["allow", "deny", "unset"]);
 
 const AUTO_MOD_CHANNEL_TYPES = new Set(
   [
@@ -114,9 +115,17 @@ function normalizeConfig(config) {
     const blockedChannelIds = Array.isArray(guildConfig?.blockedChannelIds)
       ? guildConfig.blockedChannelIds
       : [];
+    const permissionFallbacks =
+      guildConfig?.permissionFallbacks && typeof guildConfig.permissionFallbacks === "object"
+        ? Object.fromEntries(
+            Object.entries(guildConfig.permissionFallbacks)
+              .filter(([channelId, state]) => SNOWFLAKE_RE.test(channelId) && PERMISSION_FALLBACK_STATES.has(state)),
+          )
+        : {};
 
     normalized.guilds[guildId] = {
       blockedChannelIds: uniqueSnowflakes(blockedChannelIds),
+      permissionFallbacks,
     };
   }
 
@@ -184,7 +193,11 @@ function parseChannelIds(input) {
 
 function ensureGuildConfig(config, guildId) {
   if (!config.guilds[guildId]) {
-    config.guilds[guildId] = { blockedChannelIds: [] };
+    config.guilds[guildId] = { blockedChannelIds: [], permissionFallbacks: {} };
+  }
+
+  if (!config.guilds[guildId].permissionFallbacks) {
+    config.guilds[guildId].permissionFallbacks = {};
   }
 
   return config.guilds[guildId];
@@ -268,6 +281,120 @@ async function fetchTargetChannels(guild, channelIds) {
   return channels;
 }
 
+function getMentionEveryoneOverwriteState(channel) {
+  const everyoneOverwrite = channel.permissionOverwrites.cache.get(channel.guild.roles.everyone.id);
+
+  if (!everyoneOverwrite) {
+    return "unset";
+  }
+
+  if (everyoneOverwrite.allow.has(PermissionFlagsBits.MentionEveryone)) {
+    return "allow";
+  }
+
+  if (everyoneOverwrite.deny.has(PermissionFlagsBits.MentionEveryone)) {
+    return "deny";
+  }
+
+  return "unset";
+}
+
+function permissionValueFromFallbackState(state) {
+  if (state === "allow") {
+    return true;
+  }
+
+  if (state === "deny") {
+    return false;
+  }
+
+  return null;
+}
+
+async function assertBotCanManageChannel(channel, botMember) {
+  const permissions = channel.permissionsFor(botMember);
+
+  if (!permissions?.has(PermissionFlagsBits.ManageChannels)) {
+    throw new UserFacingError(`봇에 <#${channel.id}> 채널의 \`Manage Channels\` 권한이 필요합니다.`);
+  }
+}
+
+async function restorePermissionFallbacks(guild, permissionFallbacks) {
+  const botMember = await guild.members.fetchMe();
+  const nextPermissionFallbacks = { ...permissionFallbacks };
+  let restoredCount = 0;
+
+  for (const [channelId, previousState] of Object.entries(permissionFallbacks)) {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+
+    if (channel && isEligibleAutoModChannel(channel)) {
+      await assertBotCanManageChannel(channel, botMember);
+      await channel.permissionOverwrites.edit(
+        guild.roles.everyone,
+        { MentionEveryone: permissionValueFromFallbackState(previousState) },
+        { reason: "Restore role mention permission fallback" },
+      );
+      restoredCount += 1;
+    }
+
+    delete nextPermissionFallbacks[channelId];
+  }
+
+  return { permissionFallbacks: nextPermissionFallbacks, restoredCount };
+}
+
+async function syncPermissionFallbacks(guild, blockedChannelIds, permissionFallbacks) {
+  const botMember = await guild.members.fetchMe();
+  const targetChannelIdSet = new Set(blockedChannelIds);
+  const nextPermissionFallbacks = { ...permissionFallbacks };
+  let appliedCount = 0;
+  let restoredCount = 0;
+
+  for (const [channelId, previousState] of Object.entries(permissionFallbacks)) {
+    if (targetChannelIdSet.has(channelId)) {
+      continue;
+    }
+
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+
+    if (channel && isEligibleAutoModChannel(channel)) {
+      await assertBotCanManageChannel(channel, botMember);
+      await channel.permissionOverwrites.edit(
+        guild.roles.everyone,
+        { MentionEveryone: permissionValueFromFallbackState(previousState) },
+        { reason: "Restore role mention permission fallback" },
+      );
+      restoredCount += 1;
+    }
+
+    delete nextPermissionFallbacks[channelId];
+  }
+
+  for (const channelId of blockedChannelIds) {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+
+    if (!channel || !isEligibleAutoModChannel(channel)) {
+      delete nextPermissionFallbacks[channelId];
+      continue;
+    }
+
+    await assertBotCanManageChannel(channel, botMember);
+
+    if (!Object.prototype.hasOwnProperty.call(nextPermissionFallbacks, channelId)) {
+      nextPermissionFallbacks[channelId] = getMentionEveryoneOverwriteState(channel);
+    }
+
+    await channel.permissionOverwrites.edit(
+      guild.roles.everyone,
+      { MentionEveryone: false },
+      { reason: "Fallback role mention block for this channel" },
+    );
+    appliedCount += 1;
+  }
+
+  return { permissionFallbacks: nextPermissionFallbacks, appliedCount, restoredCount };
+}
+
 async function findManagedAutoModRule(guild) {
   const rules = await guild.autoModerationRules.fetch();
   return rules.find((rule) => rule.name === MANAGED_RULE_NAME) ?? null;
@@ -285,7 +412,7 @@ async function deleteManagedAutoModRule(guild, reason) {
   return true;
 }
 
-async function syncAutoModRule(guild, requestedBlockedChannelIds) {
+async function syncAutoModRule(guild, requestedBlockedChannelIds, permissionFallbacks = {}) {
   await assertBotCanManageAutoMod(guild);
   await guild.channels.fetch();
   await guild.roles.fetch();
@@ -298,6 +425,8 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
   const existingRule = await findManagedAutoModRule(guild);
 
   if (blockedChannelIds.length === 0) {
+    const permissionResult = await restorePermissionFallbacks(guild, permissionFallbacks);
+
     if (existingRule) {
       await existingRule.delete("No blocked channels remain");
     }
@@ -305,6 +434,10 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
     return {
       blockedChannelIds,
       exemptChannelCount: 0,
+      mode: "none",
+      permissionFallbacks: permissionResult.permissionFallbacks,
+      permissionAppliedCount: 0,
+      permissionRestoredCount: permissionResult.restoredCount,
       ruleAction: existingRule ? "deleted" : "none",
     };
   }
@@ -315,20 +448,28 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
     .filter((channelId) => !blockedChannelIdSet.has(channelId));
 
   if (exemptChannelIds.length > MAX_EXEMPT_CHANNELS) {
+    const ruleAction = existingRule ? "deleted" : "none";
+
     if (existingRule) {
       await existingRule.delete("Exempt channel limit exceeded; avoid blocking unconfigured channels");
     }
 
-    throw new UserFacingError(
-      [
-        `현재 구성은 제외 채널이 ${exemptChannelIds.length}개라 AutoMod 제한(${MAX_EXEMPT_CHANNELS}개)을 넘습니다.`,
-        `현재 차단 대상 채널은 ${blockedChannelIds.length}개입니다.`,
-        `발송 전 차단을 적용하려면 차단 대상 채널을 최소 ${blockedChannelIds.length + exemptChannelIds.length - MAX_EXEMPT_CHANNELS}개로 늘려야 합니다.`,
-        `/멘션차단 채널id:채널1,채널2,... 형태로 ${exemptChannelIds.length - MAX_EXEMPT_CHANNELS}개 이상 더 추가해주세요.`,
-        "차단하지 않은 채널이 막히지 않도록 기존 AutoMod 규칙은 삭제했습니다.",
-      ].join("\n"),
-    );
+    const permissionResult = await syncPermissionFallbacks(guild, blockedChannelIds, permissionFallbacks);
+
+    return {
+      blockedChannelIds,
+      exemptChannelCount: exemptChannelIds.length,
+      mode: "channel-permissions",
+      minimumBlockedChannelCount: blockedChannelIds.length + exemptChannelIds.length - MAX_EXEMPT_CHANNELS,
+      neededAdditionalBlockedChannels: exemptChannelIds.length - MAX_EXEMPT_CHANNELS,
+      permissionFallbacks: permissionResult.permissionFallbacks,
+      permissionAppliedCount: permissionResult.appliedCount,
+      permissionRestoredCount: permissionResult.restoredCount,
+      ruleAction,
+    };
   }
+
+  const permissionResult = await restorePermissionFallbacks(guild, permissionFallbacks);
 
   const rulePayload = {
     name: MANAGED_RULE_NAME,
@@ -359,6 +500,10 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
     return {
       blockedChannelIds,
       exemptChannelCount: exemptChannelIds.length,
+      mode: "automod",
+      permissionFallbacks: permissionResult.permissionFallbacks,
+      permissionAppliedCount: 0,
+      permissionRestoredCount: permissionResult.restoredCount,
       ruleAction: "updated",
     };
   }
@@ -371,21 +516,30 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
   return {
     blockedChannelIds,
     exemptChannelCount: exemptChannelIds.length,
+    mode: "automod",
+    permissionFallbacks: permissionResult.permissionFallbacks,
+    permissionAppliedCount: 0,
+    permissionRestoredCount: permissionResult.restoredCount,
     ruleAction: "created",
   };
 }
 
-async function saveGuildBlockedChannels(config, guildId, blockedChannelIds) {
-  if (blockedChannelIds.length === 0) {
+async function saveGuildBlockedChannels(config, guildId, blockedChannelIds, permissionFallbacks = {}) {
+  const normalizedFallbacks = Object.fromEntries(
+    Object.entries(permissionFallbacks)
+      .filter(([channelId, state]) => SNOWFLAKE_RE.test(channelId) && PERMISSION_FALLBACK_STATES.has(state)),
+  );
+
+  if (blockedChannelIds.length === 0 && Object.keys(normalizedFallbacks).length === 0) {
     delete config.guilds[guildId];
   } else {
-    config.guilds[guildId] = { blockedChannelIds };
+    config.guilds[guildId] = { blockedChannelIds, permissionFallbacks: normalizedFallbacks };
   }
 
   await writeConfig(config);
 }
 
-function formatChannelList(channelIds) {
+function formatChannelList(channelIds, permissionFallbackCount = 0) {
   if (channelIds.length === 0) {
     return "현재 역할 멘션 차단 대상 채널이 없습니다.";
   }
@@ -394,6 +548,9 @@ function formatChannelList(channelIds) {
     "현재 역할 멘션 차단 대상 채널입니다.",
     "",
     ...channelIds.map((channelId) => `- <#${channelId}> (${channelId})`),
+    ...(permissionFallbackCount > 0
+      ? ["", `Ticket Tool 대응용 채널 권한 fallback 적용: ${permissionFallbackCount}개`]
+      : []),
   ].join("\n");
 }
 
@@ -405,6 +562,27 @@ function formatChannelMentions(channelIds) {
   return `${shownChannelIds.map((channelId) => `<#${channelId}>`).join(", ")}${suffix}`;
 }
 
+function formatSyncResultLines(result) {
+  if (result.mode === "channel-permissions") {
+    return [
+      "적용 방식: 채널 권한 fallback",
+      "Ticket Tool 등으로 채널이 계속 늘어나 AutoMod 예외 채널 50개 제한을 넘었습니다.",
+      `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
+      `권한 fallback 적용 채널 수: ${Object.keys(result.permissionFallbacks).length}`,
+      `현재 차단 대상 채널 수: ${result.blockedChannelIds.length}`,
+      `AutoMod 제외 채널 수: ${result.exemptChannelCount}/${MAX_EXEMPT_CHANNELS}`,
+      `AutoMod 발송 전 차단을 다시 쓰려면 차단 대상 채널을 최소 ${result.minimumBlockedChannelCount}개로 늘려야 합니다.`,
+    ];
+  }
+
+  return [
+    "적용 방식: AutoMod 발송 전 차단",
+    `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
+    `현재 차단 대상 채널 수: ${result.blockedChannelIds.length}`,
+    `제외 채널 수: ${result.exemptChannelCount}/${MAX_EXEMPT_CHANNELS}`,
+  ];
+}
+
 async function handleBlock(interaction) {
   const channelIds = parseChannelIds(interaction.options.getString("채널id", true));
 
@@ -413,15 +591,22 @@ async function handleBlock(interaction) {
   const guildConfig = ensureGuildConfig(config, interaction.guildId);
   const targetChannelIds = channels.map((channel) => channel.id);
   const requestedBlockedIds = uniqueSnowflakes([...guildConfig.blockedChannelIds, ...targetChannelIds]);
-  const result = await syncAutoModRule(interaction.guild, requestedBlockedIds);
+  const result = await syncAutoModRule(
+    interaction.guild,
+    requestedBlockedIds,
+    guildConfig.permissionFallbacks,
+  );
 
-  await saveGuildBlockedChannels(config, interaction.guildId, result.blockedChannelIds);
+  await saveGuildBlockedChannels(
+    config,
+    interaction.guildId,
+    result.blockedChannelIds,
+    result.permissionFallbacks,
+  );
   await interaction.editReply({
     content: [
       `${formatChannelMentions(targetChannelIds)} 채널에서 역할 멘션을 발송 전에 차단합니다.`,
-      `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
-      `현재 차단 대상 채널 수: ${result.blockedChannelIds.length}`,
-      `제외 채널 수: ${result.exemptChannelCount}/${MAX_EXEMPT_CHANNELS}`,
+      ...formatSyncResultLines(result),
     ].join("\n"),
     allowedMentions: { parse: [] },
   });
@@ -438,14 +623,22 @@ async function handleUnblock(interaction) {
   const requestedBlockedIds = guildConfig.blockedChannelIds.filter(
     (id) => !unblockChannelIdSet.has(id),
   );
-  const result = await syncAutoModRule(interaction.guild, requestedBlockedIds);
+  const result = await syncAutoModRule(
+    interaction.guild,
+    requestedBlockedIds,
+    guildConfig.permissionFallbacks,
+  );
 
-  await saveGuildBlockedChannels(config, interaction.guildId, result.blockedChannelIds);
+  await saveGuildBlockedChannels(
+    config,
+    interaction.guildId,
+    result.blockedChannelIds,
+    result.permissionFallbacks,
+  );
   await interaction.editReply({
     content: [
       `${formatChannelMentions(channelIds)} 채널의 역할 멘션 발송 전 차단을 해제했습니다.`,
-      `AutoMod 규칙: ${translateRuleAction(result.ruleAction)}`,
-      `남은 차단 채널 수: ${result.blockedChannelIds.length}`,
+      ...formatSyncResultLines(result),
     ].join("\n"),
     allowedMentions: { parse: [] },
   });
@@ -453,17 +646,29 @@ async function handleUnblock(interaction) {
 
 async function handleList(interaction) {
   const config = await readConfig();
-  const blockedChannelIds = config.guilds[interaction.guildId]?.blockedChannelIds ?? [];
+  const guildConfig = config.guilds[interaction.guildId] ?? {
+    blockedChannelIds: [],
+    permissionFallbacks: {},
+  };
 
   await interaction.editReply({
-    content: formatChannelList(blockedChannelIds),
+    content: formatChannelList(
+      guildConfig.blockedChannelIds,
+      Object.keys(guildConfig.permissionFallbacks).length,
+    ),
     allowedMentions: { parse: [] },
   });
 }
 
 async function handleReset(interaction) {
   const config = await readConfig();
-  const hadSavedConfig = Boolean(config.guilds[interaction.guildId]);
+  const guildConfig = ensureGuildConfig(config, interaction.guildId);
+  const hadSavedConfig =
+    guildConfig.blockedChannelIds.length > 0 || Object.keys(guildConfig.permissionFallbacks).length > 0;
+  const permissionResult = await restorePermissionFallbacks(
+    interaction.guild,
+    guildConfig.permissionFallbacks,
+  );
   const deletedRule = await deleteManagedAutoModRule(
     interaction.guild,
     "Reset role mention block config for this guild",
@@ -476,6 +681,7 @@ async function handleReset(interaction) {
       "이 서버의 역할 멘션 차단 설정을 초기화했습니다.",
       `저장된 차단 채널: ${hadSavedConfig ? "삭제됨" : "없음"}`,
       `AutoMod 규칙: ${deletedRule ? "삭제됨" : "없음"}`,
+      `권한 fallback 복구 채널: ${permissionResult.restoredCount}개`,
     ].join("\n"),
     allowedMentions: { parse: [] },
   });
@@ -576,9 +782,16 @@ async function registerCommands(client) {
 
 async function syncGuildFromConfig(client, guildId) {
   const config = await readConfig();
-  const blockedChannelIds = config.guilds[guildId]?.blockedChannelIds ?? [];
+  const guildConfig = config.guilds[guildId];
 
-  if (blockedChannelIds.length === 0) {
+  if (!guildConfig) {
+    return;
+  }
+
+  const blockedChannelIds = guildConfig.blockedChannelIds ?? [];
+  const permissionFallbacks = guildConfig.permissionFallbacks ?? {};
+
+  if (blockedChannelIds.length === 0 && Object.keys(permissionFallbacks).length === 0) {
     return;
   }
 
@@ -588,11 +801,8 @@ async function syncGuildFromConfig(client, guildId) {
     return;
   }
 
-  const result = await syncAutoModRule(guild, blockedChannelIds);
-
-  if (result.blockedChannelIds.length !== blockedChannelIds.length) {
-    await saveGuildBlockedChannels(config, guildId, result.blockedChannelIds);
-  }
+  const result = await syncAutoModRule(guild, blockedChannelIds, permissionFallbacks);
+  await saveGuildBlockedChannels(config, guildId, result.blockedChannelIds, result.permissionFallbacks);
 }
 
 async function syncAllConfiguredGuilds(client) {
