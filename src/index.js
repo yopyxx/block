@@ -18,6 +18,7 @@ const COMMANDS = {
   block: "멘션차단",
   unblock: "멘션차단해제",
   list: "멘션차단목록",
+  reset: "멘션차단초기화",
 };
 
 const DATA_DIR = path.join(__dirname, "..", "data");
@@ -74,6 +75,11 @@ function buildCommands() {
     new SlashCommandBuilder()
       .setName(COMMANDS.list)
       .setDescription("현재 역할 멘션 발송 전 차단 대상 채널을 확인합니다.")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName(COMMANDS.reset)
+      .setDescription("현재 서버의 역할 멘션 차단 설정과 AutoMod 규칙을 모두 삭제합니다.")
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
       .setDMPermission(false),
   ].map((command) => command.toJSON());
@@ -267,6 +273,18 @@ async function findManagedAutoModRule(guild) {
   return rules.find((rule) => rule.name === MANAGED_RULE_NAME) ?? null;
 }
 
+async function deleteManagedAutoModRule(guild, reason) {
+  await assertBotCanManageAutoMod(guild);
+  const existingRule = await findManagedAutoModRule(guild);
+
+  if (!existingRule) {
+    return false;
+  }
+
+  await existingRule.delete(reason);
+  return true;
+}
+
 async function syncAutoModRule(guild, requestedBlockedChannelIds) {
   await assertBotCanManageAutoMod(guild);
   await guild.channels.fetch();
@@ -297,12 +315,17 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds) {
     .filter((channelId) => !blockedChannelIdSet.has(channelId));
 
   if (exemptChannelIds.length > MAX_EXEMPT_CHANNELS) {
+    if (existingRule) {
+      await existingRule.delete("Exempt channel limit exceeded; avoid blocking unconfigured channels");
+    }
+
     throw new UserFacingError(
       [
         `현재 구성은 제외 채널이 ${exemptChannelIds.length}개라 AutoMod 제한(${MAX_EXEMPT_CHANNELS}개)을 넘습니다.`,
         `현재 차단 대상 채널은 ${blockedChannelIds.length}개입니다.`,
         `발송 전 차단을 적용하려면 차단 대상 채널을 최소 ${blockedChannelIds.length + exemptChannelIds.length - MAX_EXEMPT_CHANNELS}개로 늘려야 합니다.`,
         `/멘션차단 채널id:채널1,채널2,... 형태로 ${exemptChannelIds.length - MAX_EXEMPT_CHANNELS}개 이상 더 추가해주세요.`,
+        "차단하지 않은 채널이 막히지 않도록 기존 AutoMod 규칙은 삭제했습니다.",
       ].join("\n"),
     );
   }
@@ -438,6 +461,26 @@ async function handleList(interaction) {
   });
 }
 
+async function handleReset(interaction) {
+  const config = await readConfig();
+  const hadSavedConfig = Boolean(config.guilds[interaction.guildId]);
+  const deletedRule = await deleteManagedAutoModRule(
+    interaction.guild,
+    "Reset role mention block config for this guild",
+  );
+
+  delete config.guilds[interaction.guildId];
+  await writeConfig(config);
+  await interaction.editReply({
+    content: [
+      "이 서버의 역할 멘션 차단 설정을 초기화했습니다.",
+      `저장된 차단 채널: ${hadSavedConfig ? "삭제됨" : "없음"}`,
+      `AutoMod 규칙: ${deletedRule ? "삭제됨" : "없음"}`,
+    ].join("\n"),
+    allowedMentions: { parse: [] },
+  });
+}
+
 function translateRuleAction(action) {
   switch (action) {
     case "created":
@@ -477,6 +520,12 @@ async function handleInteraction(interaction) {
 
     if (interaction.commandName === COMMANDS.list) {
       await handleList(interaction);
+      return;
+    }
+
+    if (interaction.commandName === COMMANDS.reset) {
+      await handleReset(interaction);
+      return;
     }
   } catch (error) {
     const message =
@@ -559,6 +608,30 @@ async function syncAllConfiguredGuilds(client) {
   }
 }
 
+async function cleanupUnconfiguredManagedRules(client) {
+  const config = await readConfig();
+  const configuredGuildIds = new Set(
+    Object.entries(config.guilds)
+      .filter(([, guildConfig]) => guildConfig.blockedChannelIds.length > 0)
+      .map(([guildId]) => guildId),
+  );
+
+  for (const guild of client.guilds.cache.values()) {
+    if (configuredGuildIds.has(guild.id)) {
+      continue;
+    }
+
+    try {
+      const deletedRule = await deleteManagedAutoModRule(guild, "No saved role mention block config");
+      if (deletedRule) {
+        console.log(`Deleted stale managed AutoMod rule in ${guild.name}.`);
+      }
+    } catch (error) {
+      console.error(`Failed to clean stale managed AutoMod rule in ${guild.id}:`, error);
+    }
+  }
+}
+
 const pendingGuildSyncs = new Map();
 
 function queueGuildSync(client, guildId) {
@@ -601,6 +674,7 @@ async function main() {
   client.once(Events.ClientReady, async (readyClient) => {
     console.log(`Logged in as ${readyClient.user.tag}.`);
     await registerCommands(readyClient);
+    await cleanupUnconfiguredManagedRules(readyClient);
     await syncAllConfiguredGuilds(readyClient);
   });
 
