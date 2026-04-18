@@ -21,6 +21,8 @@ const COMMANDS = {
   reset: "멘션차단초기화",
 };
 
+const TRUE_VALUES = new Set(["1", "true", "yes", "y", "on"]);
+
 const DATA_DIR = path.join(__dirname, "..", "data");
 const CONFIG_PATH = path.join(DATA_DIR, "mention-blocks.json");
 const MANAGED_RULE_NAME = "역할 멘션 차단 (bot-managed)";
@@ -151,6 +153,33 @@ function getConfiguredGuildIds() {
   return uniqueSnowflakes(rawValue.split(",").map((value) => value.trim()).filter(Boolean));
 }
 
+function getEnvList(name) {
+  return (process.env[name] ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function getAutoBlockCategoryIds() {
+  return uniqueSnowflakes(getEnvList("AUTO_BLOCK_CATEGORY_IDS"));
+}
+
+function getAutoBlockNamePrefixes() {
+  return getEnvList("AUTO_BLOCK_CHANNEL_NAME_PREFIXES").map((value) => value.toLowerCase());
+}
+
+function isAutoBlockAllNewChannelsEnabled() {
+  return TRUE_VALUES.has((process.env.AUTO_BLOCK_NEW_CHANNELS ?? "").trim().toLowerCase());
+}
+
+function hasAutoBlockChannelConfig() {
+  return (
+    isAutoBlockAllNewChannelsEnabled() ||
+    getAutoBlockCategoryIds().length > 0 ||
+    getAutoBlockNamePrefixes().length > 0
+  );
+}
+
 function parseChannelId(input) {
   const value = input.trim();
   const mentionMatch = value.match(CHANNEL_MENTION_RE);
@@ -205,6 +234,35 @@ function ensureGuildConfig(config, guildId) {
 
 function isEligibleAutoModChannel(channel) {
   return channel?.guild && AUTO_MOD_CHANNEL_TYPES.has(channel.type);
+}
+
+function shouldAutoBlockChannel(channel) {
+  if (!isEligibleAutoModChannel(channel)) {
+    return false;
+  }
+
+  if (isAutoBlockAllNewChannelsEnabled()) {
+    return true;
+  }
+
+  const categoryIds = getAutoBlockCategoryIds();
+
+  if (channel.parentId && categoryIds.includes(channel.parentId)) {
+    return true;
+  }
+
+  const channelName = channel.name?.toLowerCase() ?? "";
+  const namePrefixes = getAutoBlockNamePrefixes();
+
+  return namePrefixes.some((prefix) => channelName.startsWith(prefix));
+}
+
+function getAutoBlockChannelIds(guild, channels = guild.channels.cache) {
+  return uniqueSnowflakes(
+    [...channels.values()]
+      .filter((channel) => channel?.guildId === guild.id && shouldAutoBlockChannel(channel))
+      .map((channel) => channel.id),
+  );
 }
 
 function getEligibleAutoModChannels(guild, channels = guild.channels.cache) {
@@ -838,6 +896,61 @@ async function syncGuildFromConfig(client, guildId) {
   await saveGuildBlockedChannels(config, guildId, result.blockedChannelIds, result.permissionFallbacks);
 }
 
+async function syncAutoBlockedChannelsForGuild(guild) {
+  if (!hasAutoBlockChannelConfig()) {
+    return false;
+  }
+
+  const fetchedChannels = await guild.channels.fetch();
+  const autoBlockedChannelIds = getAutoBlockChannelIds(guild, fetchedChannels);
+
+  if (autoBlockedChannelIds.length === 0) {
+    return false;
+  }
+
+  const config = await readConfig();
+  const guildConfig = ensureGuildConfig(config, guild.id);
+  const requestedBlockedIds = uniqueSnowflakes([
+    ...guildConfig.blockedChannelIds,
+    ...autoBlockedChannelIds,
+  ]);
+
+  if (requestedBlockedIds.length === guildConfig.blockedChannelIds.length) {
+    return false;
+  }
+
+  const result = await syncAutoModRule(
+    guild,
+    requestedBlockedIds,
+    guildConfig.permissionFallbacks,
+  );
+  await saveGuildBlockedChannels(config, guild.id, result.blockedChannelIds, result.permissionFallbacks);
+  console.log(
+    `Auto-added ${requestedBlockedIds.length - guildConfig.blockedChannelIds.length} ticket channels to role mention block list in ${guild.name}.`,
+  );
+
+  return true;
+}
+
+async function syncAutoBlockedChannelsForConfiguredGuilds(client) {
+  if (!hasAutoBlockChannelConfig()) {
+    return;
+  }
+
+  const guildIds = getConfiguredGuildIds();
+  const guilds = guildIds.length > 0
+    ? await Promise.all(guildIds.map((guildId) => client.guilds.fetch(guildId).catch(() => null)))
+    : [...client.guilds.cache.values()];
+
+  for (const guild of guilds.filter(Boolean)) {
+    try {
+      await syncAutoBlockedChannelsForGuild(guild);
+    } catch (error) {
+      console.error(`Failed to auto-add ticket channels in ${guild.id}:`, error);
+    }
+  }
+}
+
 async function syncAllConfiguredGuilds(client) {
   const config = await readConfig();
 
@@ -876,6 +989,7 @@ async function cleanupUnconfiguredManagedRules(client) {
 }
 
 const pendingGuildSyncs = new Map();
+const pendingAutoBlockSyncs = new Map();
 
 function queueGuildSync(client, guildId) {
   const pendingSync = pendingGuildSyncs.get(guildId);
@@ -899,6 +1013,45 @@ function queueGuildSync(client, guildId) {
   );
 }
 
+function queueAutoBlockSync(client, guildId) {
+  if (!hasAutoBlockChannelConfig()) {
+    return false;
+  }
+
+  const pendingSync = pendingAutoBlockSyncs.get(guildId);
+
+  if (pendingSync) {
+    clearTimeout(pendingSync);
+  }
+
+  pendingAutoBlockSyncs.set(
+    guildId,
+    setTimeout(async () => {
+      pendingAutoBlockSyncs.delete(guildId);
+
+      try {
+        const guild = await client.guilds.fetch(guildId).catch(() => null);
+
+        if (!guild) {
+          return;
+        }
+
+        const changed = await syncAutoBlockedChannelsForGuild(guild);
+
+        if (!changed) {
+          await syncGuildFromConfig(client, guildId);
+        }
+
+        console.log(`Resynced auto ticket channel blocks for guild ${guildId}.`);
+      } catch (error) {
+        console.error(`Failed to resync auto ticket channel blocks for guild ${guildId}:`, error);
+      }
+    }, 1500),
+  );
+
+  return true;
+}
+
 function createClient() {
   return new Client({
     intents: [GatewayIntentBits.Guilds],
@@ -918,13 +1071,23 @@ async function main() {
     console.log(`Logged in as ${readyClient.user.tag}.`);
     await registerCommands(readyClient);
     await cleanupUnconfiguredManagedRules(readyClient);
+    await syncAutoBlockedChannelsForConfiguredGuilds(readyClient);
     await syncAllConfiguredGuilds(readyClient);
   });
 
   client.on(Events.InteractionCreate, handleInteraction);
   client.on(Events.ChannelCreate, (channel) => {
     if (channel.guildId && isEligibleAutoModChannel(channel)) {
-      queueGuildSync(client, channel.guildId);
+      if (!queueAutoBlockSync(client, channel.guildId)) {
+        queueGuildSync(client, channel.guildId);
+      }
+    }
+  });
+  client.on(Events.ChannelUpdate, (oldChannel, newChannel) => {
+    if (newChannel.guildId && isEligibleAutoModChannel(newChannel)) {
+      if (!queueAutoBlockSync(client, newChannel.guildId)) {
+        queueGuildSync(client, newChannel.guildId);
+      }
     }
   });
   client.on(Events.ChannelDelete, (channel) => {
