@@ -8,6 +8,7 @@ const {
   AutoModerationRuleTriggerType,
   ChannelType,
   Client,
+  EmbedBuilder,
   Events,
   GatewayIntentBits,
   PermissionFlagsBits,
@@ -30,6 +31,7 @@ const ROLE_MENTION_REGEX = "<@&[0-9]{17,20}>";
 const BLOCK_MESSAGE = "이 채널에서는 역할 멘션을 사용할 수 없습니다.";
 const MAX_EXEMPT_CHANNELS = 50;
 const MAX_EXEMPT_ROLES = 20;
+const CHANNELS_PER_LIST_EMBED = 30;
 const SNOWFLAKE_RE = /^\d{17,20}$/;
 const CHANNEL_MENTION_RE = /^<#(\d{17,20})>$/;
 const PERMISSION_FALLBACK_STATES = new Set(["allow", "deny", "unset"]);
@@ -630,19 +632,39 @@ async function saveGuildBlockedChannels(config, guildId, blockedChannelIds, perm
   await writeConfig(config);
 }
 
-function formatChannelList(channelIds, permissionFallbackCount = 0) {
+function buildChannelListEmbeds(channelIds, permissionFallbackCount = 0) {
   if (channelIds.length === 0) {
-    return "현재 역할 멘션 차단 대상 채널이 없습니다.";
+    return [];
   }
 
-  return [
-    "현재 역할 멘션 차단 대상 채널입니다.",
-    "",
-    ...channelIds.map((channelId) => `- <#${channelId}> (${channelId})`),
-    ...(permissionFallbackCount > 0
-      ? ["", `Ticket Tool 대응용 채널 권한 fallback 적용: ${permissionFallbackCount}개`]
-      : []),
-  ].join("\n");
+  const totalPages = Math.ceil(channelIds.length / CHANNELS_PER_LIST_EMBED);
+
+  return Array.from({ length: totalPages }, (_, pageIndex) => {
+    const startIndex = pageIndex * CHANNELS_PER_LIST_EMBED;
+    const pageChannelIds = channelIds.slice(startIndex, startIndex + CHANNELS_PER_LIST_EMBED);
+    const description = pageChannelIds
+      .map((channelId, offset) => {
+        const displayIndex = startIndex + offset + 1;
+        return `${displayIndex}. <#${channelId}> (${channelId})`;
+      })
+      .join("\n");
+
+    const embed = new EmbedBuilder()
+      .setTitle(`역할 멘션 차단 채널 목록 (${pageIndex + 1}/${totalPages})`)
+      .setDescription(description)
+      .setFooter({
+        text: `총 ${channelIds.length}개`,
+      });
+
+    if (pageIndex === 0 && permissionFallbackCount > 0) {
+      embed.addFields({
+        name: "채널 권한 fallback",
+        value: `${permissionFallbackCount}개 채널에 적용 중`,
+      });
+    }
+
+    return embed;
+  });
 }
 
 function formatChannelMentions(channelIds) {
@@ -741,14 +763,33 @@ async function handleList(interaction) {
     blockedChannelIds: [],
     permissionFallbacks: {},
   };
+  const permissionFallbackCount = Object.keys(guildConfig.permissionFallbacks).length;
+  const embeds = buildChannelListEmbeds(guildConfig.blockedChannelIds, permissionFallbackCount);
+
+  if (embeds.length === 0) {
+    await interaction.editReply({
+      content: "현재 역할 멘션 차단 대상 채널이 없습니다.",
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
 
   await interaction.editReply({
-    content: formatChannelList(
-      guildConfig.blockedChannelIds,
-      Object.keys(guildConfig.permissionFallbacks).length,
-    ),
+    content: [
+      `현재 역할 멘션 차단 대상 채널은 총 ${guildConfig.blockedChannelIds.length}개입니다.`,
+      `목록은 ${embeds.length}개 임베드로 나누어 표시합니다.`,
+    ].join("\n"),
+    embeds: [embeds[0]],
     allowedMentions: { parse: [] },
   });
+
+  for (const embed of embeds.slice(1)) {
+    await interaction.followUp({
+      embeds: [embed],
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+  }
 }
 
 async function handleReset(interaction) {
