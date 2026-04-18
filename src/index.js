@@ -207,9 +207,9 @@ function isEligibleAutoModChannel(channel) {
   return channel?.guild && AUTO_MOD_CHANNEL_TYPES.has(channel.type);
 }
 
-function getEligibleAutoModChannels(guild) {
-  return [...guild.channels.cache.values()]
-    .filter(isEligibleAutoModChannel)
+function getEligibleAutoModChannels(guild, channels = guild.channels.cache) {
+  return [...channels.values()]
+    .filter((channel) => channel?.guildId === guild.id && isEligibleAutoModChannel(channel))
     .sort((left, right) => {
       if (left.rawPosition !== right.rawPosition) {
         return left.rawPosition - right.rawPosition;
@@ -217,6 +217,16 @@ function getEligibleAutoModChannels(guild) {
 
       return left.id.localeCompare(right.id);
     });
+}
+
+function isInvalidAutoModExemptChannelError(error) {
+  if (error?.code !== 50035) {
+    return false;
+  }
+
+  return JSON.stringify(error.rawError?.errors?.exempt_channels ?? {}).includes(
+    "INVALID_AUTO_MODERATION_CHANNEL_IN_EXEMPTIONS",
+  );
 }
 
 function getExtraExemptRoleIds(guild) {
@@ -412,12 +422,17 @@ async function deleteManagedAutoModRule(guild, reason) {
   return true;
 }
 
-async function syncAutoModRule(guild, requestedBlockedChannelIds, permissionFallbacks = {}) {
+async function syncAutoModRule(
+  guild,
+  requestedBlockedChannelIds,
+  permissionFallbacks = {},
+  retryOnInvalidExemptChannel = true,
+) {
   await assertBotCanManageAutoMod(guild);
-  await guild.channels.fetch();
+  const fetchedChannels = await guild.channels.fetch();
   await guild.roles.fetch();
 
-  const eligibleChannels = getEligibleAutoModChannels(guild);
+  const eligibleChannels = getEligibleAutoModChannels(guild, fetchedChannels);
   const eligibleChannelIds = new Set(eligibleChannels.map((channel) => channel.id));
   const blockedChannelIds = uniqueSnowflakes(requestedBlockedChannelIds).filter((channelId) =>
     eligibleChannelIds.has(channelId),
@@ -492,10 +507,19 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds, permissionFall
   };
 
   if (existingRule) {
-    await existingRule.edit({
-      ...rulePayload,
-      reason: "Update role mention block channels",
-    });
+    try {
+      await existingRule.edit({
+        ...rulePayload,
+        reason: "Update role mention block channels",
+      });
+    } catch (error) {
+      if (retryOnInvalidExemptChannel && isInvalidAutoModExemptChannelError(error)) {
+        console.warn(`Retrying AutoMod sync for ${guild.id}; an exempt channel was deleted during sync.`);
+        return syncAutoModRule(guild, requestedBlockedChannelIds, permissionFallbacks, false);
+      }
+
+      throw error;
+    }
 
     return {
       blockedChannelIds,
@@ -508,10 +532,19 @@ async function syncAutoModRule(guild, requestedBlockedChannelIds, permissionFall
     };
   }
 
-  await guild.autoModerationRules.create({
-    ...rulePayload,
-    reason: "Create role mention block rule",
-  });
+  try {
+    await guild.autoModerationRules.create({
+      ...rulePayload,
+      reason: "Create role mention block rule",
+    });
+  } catch (error) {
+    if (retryOnInvalidExemptChannel && isInvalidAutoModExemptChannelError(error)) {
+      console.warn(`Retrying AutoMod sync for ${guild.id}; an exempt channel was deleted during sync.`);
+      return syncAutoModRule(guild, requestedBlockedChannelIds, permissionFallbacks, false);
+    }
+
+    throw error;
+  }
 
   return {
     blockedChannelIds,
